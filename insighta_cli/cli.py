@@ -20,7 +20,7 @@ from rich import box
 # ── Config ────────────────────────────────────────────────────────────────────
 
 CREDENTIALS_PATH = Path.home() / ".insighta" / "credentials.json"
-DEFAULT_BASE_URL = os.environ.get("INSIGHTA_API_URL", "https://insighta-backend.onrender.com")
+DEFAULT_BASE_URL = os.environ.get("INSIGHTA_API_URL", "https://backendrepositorycoresystem-production.up.railway.app")
 
 console = Console()
 
@@ -49,7 +49,7 @@ def _clear_creds() -> None:
 # ── HTTP client with auto-refresh ─────────────────────────────────────────────
 
 def _client(base_url: str) -> httpx.Client:
-    return httpx.Client(base_url=base_url, timeout=15.0)
+    return httpx.Client(base_url=base_url, timeout=60.0)
 
 
 def _authed_headers(creds: dict, base_url: str) -> dict:
@@ -89,7 +89,7 @@ def _require_login(ctx: click.Context) -> tuple[dict, str]:
 
 def _api_get(url: str, headers: dict, params: dict = None) -> httpx.Response:
     base_url = url.rsplit("/api/", 1)[0] if "/api/" in url else DEFAULT_BASE_URL
-    with httpx.Client(timeout=15.0) as client:
+    with httpx.Client(timeout=60.0) as client:
         return client.get(url, headers=headers, params=params or {})
 
 
@@ -138,29 +138,34 @@ def login(ctx):
     """Authenticate with GitHub OAuth (opens browser)."""
     base_url = ctx.obj["base_url"]
 
-    with _client(base_url) as client:
-        resp = client.get("/auth/github/")
+    from urllib.parse import urlencode, parse_qs, urlparse, urlunparse
 
-    if resp.status_code != 200:
+    with _client(base_url) as client:
+        resp = client.get("/auth/github/", follow_redirects=False)
+
+    if resp.status_code not in (200, 302):
         console.print(f"[red]Failed to start auth: {resp.text}[/red]")
         sys.exit(1)
 
-    data = resp.json()
-    redirect_url = data["redirect_url"]
-    state = data["state"]
-
-    # Patch the callback to localhost for CLI use
     local_callback = "http://localhost:9876/auth/github/callback/"
-    redirect_url = redirect_url.replace(
-        base_url.rstrip("/") + "/auth/github/callback/", local_callback
-    )
-    # Replace redirect_uri in the URL
-    from urllib.parse import urlencode, parse_qs, urlparse, urlunparse
-    parsed = urlparse(redirect_url)
-    qs = parse_qs(parsed.query, keep_blank_values=True)
-    qs["redirect_uri"] = [local_callback]
-    new_qs = urlencode({k: v[0] for k, v in qs.items()})
-    redirect_url = urlunparse(parsed._replace(query=new_qs))
+
+    if resp.status_code == 302:
+        redirect_url = resp.headers.get("location", "")
+        parsed = urlparse(redirect_url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        state = (qs.get("state") or [""])[0]
+        qs["redirect_uri"] = [local_callback]
+        new_qs = urlencode({k: v[0] for k, v in qs.items()})
+        redirect_url = urlunparse(parsed._replace(query=new_qs))
+    else:
+        data = resp.json()
+        redirect_url = data["redirect_url"]
+        state = data["state"]
+        parsed = urlparse(redirect_url)
+        qs = parse_qs(parsed.query, keep_blank_values=True)
+        qs["redirect_uri"] = [local_callback]
+        new_qs = urlencode({k: v[0] for k, v in qs.items()})
+        redirect_url = urlunparse(parsed._replace(query=new_qs))
 
     _CallbackHandler.received = {}
     _CallbackHandler.done = Event()
