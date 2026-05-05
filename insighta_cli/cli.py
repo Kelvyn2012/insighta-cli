@@ -6,10 +6,7 @@ import os
 import sys
 import time
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from threading import Event
-from urllib.parse import parse_qs, urlparse
 
 import click
 import httpx
@@ -93,30 +90,6 @@ def _api_get(url: str, headers: dict, params: dict = None) -> httpx.Response:
         return client.get(url, headers=headers, params=params or {})
 
 
-# ── OAuth callback server ─────────────────────────────────────────────────────
-
-class _CallbackHandler(BaseHTTPRequestHandler):
-    received: dict = {}
-    done: Event = Event()
-
-    def do_GET(self):
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        self.received["code"] = qs.get("code", [None])[0]
-        self.received["state"] = qs.get("state", [None])[0]
-        self.received["error"] = qs.get("error", [None])[0]
-
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html")
-        self.end_headers()
-        self.wfile.write(
-            b"<html><body><h2>Login successful! You can close this tab.</h2></body></html>"
-        )
-        self.done.set()
-
-    def log_message(self, *args):
-        pass  # silence server logs
-
 
 # ── CLI entry point ───────────────────────────────────────────────────────────
 
@@ -138,8 +111,6 @@ def login(ctx):
     """Authenticate with GitHub OAuth (opens browser)."""
     base_url = ctx.obj["base_url"]
 
-    from urllib.parse import urlencode, parse_qs, urlparse, urlunparse
-
     with _client(base_url) as client:
         resp = client.get("/auth/github/", follow_redirects=False)
 
@@ -147,62 +118,23 @@ def login(ctx):
         console.print(f"[red]Failed to start auth: {resp.text}[/red]")
         sys.exit(1)
 
-    local_callback = "http://localhost:9876/auth/github/callback/"
+    github_url = resp.headers.get("location", "") if resp.status_code == 302 else resp.json().get("redirect_url", "")
 
-    if resp.status_code == 302:
-        redirect_url = resp.headers.get("location", "")
-        parsed = urlparse(redirect_url)
-        qs = parse_qs(parsed.query, keep_blank_values=True)
-        state = (qs.get("state") or [""])[0]
-        qs["redirect_uri"] = [local_callback]
-        new_qs = urlencode({k: v[0] for k, v in qs.items()})
-        redirect_url = urlunparse(parsed._replace(query=new_qs))
-    else:
-        data = resp.json()
-        redirect_url = data["redirect_url"]
-        state = data["state"]
-        parsed = urlparse(redirect_url)
-        qs = parse_qs(parsed.query, keep_blank_values=True)
-        qs["redirect_uri"] = [local_callback]
-        new_qs = urlencode({k: v[0] for k, v in qs.items()})
-        redirect_url = urlunparse(parsed._replace(query=new_qs))
-
-    _CallbackHandler.received = {}
-    _CallbackHandler.done = Event()
-
-    server = HTTPServer(("localhost", 9876), _CallbackHandler)
+    console.print(f"[dim]Auth URL: {github_url}[/dim]")
     console.print("[cyan]Opening GitHub login in your browser...[/cyan]")
-    webbrowser.open(redirect_url)
+    console.print()
+    console.print("[yellow]After you authorize on GitHub, your browser will show a JSON response.[/yellow]")
+    console.print("[yellow]Copy the [bold]access_token[/bold] and [bold]refresh_token[/bold] values and paste them below.[/yellow]")
+    console.print()
+    webbrowser.open(github_url)
 
-    server.timeout = 120
-    while not _CallbackHandler.done.is_set():
-        server.handle_request()
+    access_token = click.prompt("Access token")
+    refresh_token = click.prompt("Refresh token")
 
-    server.server_close()
-
-    if _CallbackHandler.received.get("error"):
-        console.print(f"[red]GitHub denied: {_CallbackHandler.received['error']}[/red]")
-        sys.exit(1)
-
-    code = _CallbackHandler.received.get("code")
-    recv_state = _CallbackHandler.received.get("state")
-
-    if not code or recv_state != state:
-        console.print("[red]Invalid callback — state mismatch.[/red]")
-        sys.exit(1)
-
-    with _client(base_url) as client:
-        resp = client.get("/auth/github/callback/", params={"code": code, "state": recv_state})
-
-    if resp.status_code != 200:
-        console.print(f"[red]Token exchange failed: {resp.json().get('message')}[/red]")
-        sys.exit(1)
-
-    token_data = resp.json()
     _save_creds({
-        "access_token": token_data["access_token"],
-        "refresh_token": token_data["refresh_token"],
-        "expires_at": time.time() + token_data.get("expires_in", 170),
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "expires_at": time.time() + 170,
         "base_url": base_url,
     })
     console.print("[green]✓ Logged in successfully.[/green]")
@@ -473,6 +405,54 @@ def profiles_delete(ctx, profile_id, yes):
     else:
         console.print(f"[red]{resp.text}[/red]")
         sys.exit(1)
+
+
+# ── profiles upload ───────────────────────────────────────────────────────────
+
+@profiles.command("upload")
+@click.argument("csv_file", type=click.Path(exists=True, dir_okay=False, readable=True))
+@click.pass_context
+def profiles_upload(ctx, csv_file):
+    """Bulk-insert profiles from a CSV file (admin only)."""
+    creds, base_url = _require_login(ctx)
+    headers = _authed_headers(creds, base_url)
+
+    with open(csv_file, "rb") as f:
+        with _client(base_url) as client:
+            resp = client.post(
+                "/api/profiles/upload/",
+                headers=headers,
+                files={"file": (Path(csv_file).name, f, "text/csv")},
+            )
+
+    if resp.status_code == 403:
+        console.print("[red]Admin access required.[/red]")
+        sys.exit(1)
+    if resp.status_code == 413:
+        console.print("[red]File exceeds the 150 MB limit.[/red]")
+        sys.exit(1)
+    if resp.status_code == 415:
+        console.print("[red]Only CSV files are accepted.[/red]")
+        sys.exit(1)
+    if resp.status_code != 200:
+        console.print(f"[red]{resp.json().get('message', resp.text)}[/red]")
+        sys.exit(1)
+
+    body = resp.json()
+    console.print("[green]✓ Upload complete[/green]")
+
+    table = Table(box=box.SIMPLE, show_header=False)
+    table.add_column("", style="bold cyan")
+    table.add_column("", justify="right")
+    table.add_row("Total rows", str(body["total_rows"]))
+    table.add_row("Inserted", f"[green]{body['inserted']}[/green]")
+    table.add_row("Skipped", str(body["skipped"]))
+    console.print(table)
+
+    if body.get("reasons"):
+        console.print("[dim]Skip reasons:[/dim]")
+        for reason, count in body["reasons"].items():
+            console.print(f"  [dim]{reason}: {count}[/dim]")
 
 
 if __name__ == "__main__":
